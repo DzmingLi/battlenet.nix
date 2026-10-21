@@ -362,6 +362,13 @@ repository rule that prohibits bot pushes must allow this workflow's commits.
 Publication integrates current main in an isolated checkout and retries competing
 pushes, never force-pushing. Catalogs changed by another publisher are retained.
 Each initialization changes only its own game file.
+Release cleanup preserves catalog references from all runs still eligible for
+GitHub's 30-day re-run window, including the run doing the cleanup, and all
+unfinished runs. Recent uncommitted uploads are retained for recovery too.
+If an older catalog is unavailable, the updater skips that optional hash-reuse
+source and downloads and verifies the required objects against official manifests.
+Publication retries uploads and pinned-hash verification, reporting both errors
+if the release asset remains unavailable.
 Before publishing, the workflow saves the verified Nix catalog as a GitHub Actions
 artifact for seven days. A Git conflict can therefore be resolved from that
 artifact without downloading the complete game again.

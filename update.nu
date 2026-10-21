@@ -299,6 +299,22 @@ def validate-record [path: string, nixpkgs: string] {
   exec ['nix' 'eval' '--raw' '--impure' '--expr' $expression] | ignore
 }
 
+# Upload errors and release download propagation must remain visible. An existing
+# immutable asset is accepted only after Nix verifies its unpacked NAR hash.
+export def upload-catalog [archive: string, url: string, hash: string, repository: string] {
+  mut last_error = ''
+  for delay in [0sec 1sec 2sec 4sec] {
+    if $delay != 0sec { sleep $delay }
+    let upload = (^gh release upload catalogs $archive '--repo' $repository | complete)
+    let fetched = (^nix eval --raw --impure --expr
+      $"builtins.fetchTarball { url = (to-nix $url); sha256 = (to-nix $hash); }" | complete)
+    if $fetched.exit_code == 0 { return ($fetched.stdout | str trim) }
+    $last_error = $"Upload: ($upload.stderr)\nVerification: ($fetched.stderr)"
+    print --stderr $last_error
+  }
+  error make {msg: $"Catalog publication failed after four attempts: ($last_error)"}
+}
+
 export def compact-catalogs [directory: string, --repository: string = 'DzmingLi/battlenet.nix'] {
   let release_tag = 'catalogs'
   let candidates = (glob ($directory | path join '*.nix') | where {|path|
@@ -334,11 +350,7 @@ export def compact-catalogs [directory: string, --repository: string = 'DzmingLi
       let archive = ($work | path join $asset)
       mv $compressed $archive
       let url = $"https://github.com/($repository)/releases/download/($release_tag)/($asset)"
-      let upload = (^gh release upload $release_tag $archive '--repo' $repository | complete)
-      # Never overwrite an existing content-addressed asset. A duplicate is
-      # accepted only after fetching and verifying the pinned unpacked contents.
-      let fetched = (exec ['nix' 'eval' '--raw' '--impure' '--expr'
-        $"builtins.fetchTarball { url = (to-nix $url); sha256 = (to-nix $hash); }"] | str trim)
+      let fetched = (upload-catalog $archive $url $hash $repository)
       let roundtrip = (exec ['nix' 'eval' '--json' '--file' ($fetched | path join catalog.nix)] | hash sha256)
       if $roundtrip != $semantic_hash { error make {msg: 'Published catalog differs from the verified installation data'} }
       let text = [
@@ -427,12 +439,18 @@ export def catalog-prune-plan [assets: list, keep: list<string>, cutoff: datetim
   }
 }
 
-def active-catalog-runs [repository: string] {
-  let own = ($env | get -o GITHUB_RUN_ID | default '0' | into int)
+export def catalog-retained-runs [runs: list, cutoff: datetime] {
+  # GitHub re-runs keep their original SHA and are allowed for 30 days.
+  # Include this run too: cleanup must preserve its own retry dependencies.
+  $runs | where {|run|
+    $run.status != 'completed' or ($run.created_at | into datetime) >= $cutoff
+  } | select id head_sha created_at | sort-by id
+}
+
+def retained-catalog-runs [repository: string, cutoff: datetime] {
   exec ['gh' 'api' '--paginate' '--slurp' $"repos/($repository)/actions/runs?per_page=100"] |
     from json | get workflow_runs | flatten |
-    where {|run| $run.status != 'completed' and $run.id != $own } |
-    select id head_sha created_at | sort-by id
+    catalog-retained-runs $in $cutoff
 }
 
 def catalog-references [revision: string] {
@@ -443,20 +461,28 @@ def catalog-references [revision: string] {
 }
 
 export def prune-catalogs [--repository: string = 'DzmingLi/battlenet.nix', --apply] {
-  let runs = (active-catalog-runs $repository)
+  let retention_cutoff = (date now) - 30day
+  let runs = (retained-catalog-runs $repository $retention_cutoff)
   exec ['git' 'fetch' '--no-tags' 'origin' 'main'] | ignore
   let main = (exec ['git' 'rev-parse' 'FETCH_HEAD'] | str trim)
   mut keep = (catalog-references $main)
   if ($keep | is-empty) { error make {msg: 'Main has no pinned catalog assets; refusing release cleanup'} }
-  for revision in ($runs | get head_sha | uniq) {
-    exec ['git' 'fetch' '--no-tags' 'origin' $revision] | ignore
-    $keep = ($keep | append (catalog-references $revision) | uniq)
+  try {
+    for revision in ($runs | get head_sha | uniq) {
+      let local = (^git cat-file -e $"($revision)^{tree}" | complete)
+      if $local.exit_code != 0 { exec ['git' 'fetch' '--refetch' '--no-tags' 'origin' $revision] | ignore }
+      $keep = ($keep | append (catalog-references $revision) | uniq)
+    }
+  } catch {|err|
+    print --stderr $"Cannot inspect retry dependencies; release cleanup deferred: ($err.msg)"
+    return
   }
-  # An unfinished run may have uploaded an asset not committed to main yet.
-  # Protect all uploads since the earliest active run, without a fixed grace period.
-  let cutoff = if ($runs | is-empty) { date now } else {
+  # Keep recent uncommitted uploads for retry/recovery, including this run's.
+  # An older unfinished run also protects uploads since it started.
+  let oldest = if ($runs | is-empty) { $retention_cutoff } else {
     $runs | sort-by created_at | first | get created_at | into datetime
   }
+  let cutoff = if $oldest < $retention_cutoff { $oldest } else { $retention_cutoff }
   let release = (exec ['gh' 'api' $"repos/($repository)/releases/tags/catalogs"] | from json)
   let assets = (exec ['gh' 'api' '--paginate' '--slurp'
     $"repos/($repository)/releases/($release.id)/assets?per_page=100"] | from json | flatten)
@@ -465,15 +491,29 @@ export def prune-catalogs [--repository: string = 'DzmingLi/battlenet.nix', --ap
   print $"Catalog assets: ($assets | length); protected references: ($keep | length); obsolete: ($candidates | length), ($bytes) bytes"
   for asset in $candidates {
     if not $apply { print $"Would delete ($asset.name)"; continue }
-    # Abort if publishers advance main or the active-run set changes during cleanup.
+    # Abort if publishers advance main or the retained-run set changes during cleanup.
     let latest = (exec ['gh' 'api' $"repos/($repository)/commits/main" '--jq' '.sha'] | str trim)
-    if $latest != $main or (active-catalog-runs $repository) != $runs {
+    if $latest != $main or (retained-catalog-runs $repository $retention_cutoff) != $runs {
       print 'Publication state changed; remaining cleanup deferred to the next run'
       return
     }
     exec ['gh' 'api' '--method' 'DELETE' $"repos/($repository)/releases/assets/($asset.id)"] | ignore
     print $"Deleted ($asset.name)"
   }
+}
+
+# Prior object hashes are only an optimization. Missing historical release assets
+# must not prevent reconstructing and verifying the current official closure.
+export def reuse-catalog [path: string, output: string] {
+  let result = (^nix eval --json --file ($path | path expand)
+    --apply 'g: { objects = g.installation.storage.objects or []; }' | complete)
+  if $result.exit_code != 0 {
+    print --stderr $"Cannot reuse ($path); downloading and verifying objects instead: ($result.stderr)"
+    return []
+  }
+  # Parse before writing so a broken response never becomes a reuse lock.
+  $result.stdout | from json | to json --raw | save --force --raw $output
+  ['--reuse-lock' $output]
 }
 
 # Discover language work from verified official configurations. Each result is
@@ -739,19 +779,13 @@ def main [
         let prior = ($original | get -o installation.storage)
         if $prior != null {
           let prior_file = ($work | path join prior.json)
-          let full_prior = (exec ['nix' 'eval' '--json' '--file' ($path | path expand)
-            '--apply' 'g: { objects = g.installation.storage.objects; }'])
-          $full_prior | save --force --raw $prior_file
-          $reuse_args = ($reuse_args | append ['--reuse-lock' $prior_file])
+          $reuse_args = ($reuse_args | append (reuse-catalog $path $prior_file))
         }
         for stem in [$raw_product $"($raw_product).mac"] {
           let base = ($directory | path join $"($stem).nix")
           if ($base | path exists) and ($base | path expand) != ($path | path expand) {
-            let objects = (exec ['nix' 'eval' '--json' '--file' ($base | path expand)
-              '--apply' 'g: { objects = g.installation.storage.objects or []; }'])
             let reuse_file = ($work | path join $"reuse-($stem).json")
-            $objects | save --force --raw $reuse_file
-            $reuse_args = ($reuse_args | append ['--reuse-lock' $reuse_file])
+            $reuse_args = ($reuse_args | append (reuse-catalog $base $reuse_file))
           }
         }
         let cache_flags = ['--discard-cache' ...$reuse_args]
