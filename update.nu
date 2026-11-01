@@ -2,6 +2,7 @@
 
 const BACKEND = path self | path dirname | path join ngdp.py
 const MAC_PRODUCTS = [w3 s2 s1 hero hsb d3 wow wow_classic wow_classic_era]
+const RETRY_DELAYS = [0sec 2sec 5sec 10sec 20sec 40sec 60sec 60sec]
 
 def exec [command: list<string>] {
   let result = (run-external ...$command | complete)
@@ -18,10 +19,14 @@ export def cdn-url [url: string] {
   $url | str replace --regex '^https?://(?:(?:(?:us|eu|kr)\.)?cdn\.blizzard\.com|level3(?:\.ssl)?\.blizzard\.com|blizzard\.gcdn\.cloudn\.co\.kr)(/|$)' 'https://cdn.blizzard.com${1}'
 }
 
+export def cdn-servers [servers: list<string>] {
+  # Keep the preferred global entry point and every original advertised URL.
+  ($servers | each {|server| cdn-url $server }) | append $servers | uniq
+}
+
 def http-bytes [url: string] {
-  let url = (cdn-url $url)
   mut last_error = ''
-  for delay in [0sec 1sec 2sec 4sec] {
+  for delay in $RETRY_DELAYS {
     if $delay != 0sec { sleep $delay }
     let response = (try {
       http get --raw --full --allow-errors --max-time 30sec $url
@@ -32,7 +37,7 @@ def http-bytes [url: string] {
       error make {msg: $"($url): ($last_error)"}
     }
   }
-  error make {msg: $"($url): ($last_error) after four attempts"}
+  error make {msg: $"($url): ($last_error) after ($RETRY_DELAYS | length) attempts"}
 }
 
 def ngdp-table [url: string] {
@@ -73,7 +78,7 @@ export def resolve-release [product: string, region: string, endpoint: string, -
   let advertised_servers = if ($secure ++ $plain | is-empty) {
     $cdn.Hosts | split row --regex '\s+' | where { $in != '' } | each {|host| $"http://($host)" }
   } else { $secure ++ $plain }
-  let servers = ($advertised_servers | each {|server| cdn-url $server } | uniq)
+  let servers = (cdn-servers $advertised_servers)
   let same_distribution = ($previous | get -o product) == $product and ($previous | get -o region) == $region
   let build = if $same_distribution and ($previous | get -o buildConfig.key) == $version.BuildConfig {
     $previous.buildConfig
@@ -303,7 +308,7 @@ def validate-record [path: string, nixpkgs: string] {
 # immutable asset is accepted only after Nix verifies its unpacked NAR hash.
 export def upload-catalog [archive: string, url: string, hash: string, repository: string] {
   mut last_error = ''
-  for delay in [0sec 1sec 2sec 4sec] {
+  for delay in $RETRY_DELAYS {
     if $delay != 0sec { sleep $delay }
     let upload = (^gh release upload catalogs $archive '--repo' $repository | complete)
     let fetched = (^nix eval --raw --impure --expr
@@ -312,7 +317,7 @@ export def upload-catalog [archive: string, url: string, hash: string, repositor
     $last_error = $"Upload: ($upload.stderr)\nVerification: ($fetched.stderr)"
     print --stderr $last_error
   }
-  error make {msg: $"Catalog publication failed after four attempts: ($last_error)"}
+  error make {msg: $"Catalog publication failed after ($RETRY_DELAYS | length) attempts: ($last_error)"}
 }
 
 export def compact-catalogs [directory: string, --repository: string = 'DzmingLi/battlenet.nix'] {

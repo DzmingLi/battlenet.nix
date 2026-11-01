@@ -9,7 +9,7 @@ import re
 import struct
 import zlib
 
-from ngdp import cdn_url, get, retry_request, sri
+from ngdp import get, retry_request, sri
 
 MAX_SIZE = 256 * 1024 * 1024
 
@@ -536,7 +536,6 @@ def bounded_get(url, limit, offset=None, size=None):
 
 def _bounded_get(url, limit, offset=None, size=None):
     import urllib.request
-    url = cdn_url(url)
     headers = {}
     if offset is not None:
         headers['Range'] = f'bytes={offset}-{offset + size - 1}'

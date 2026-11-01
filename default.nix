@@ -9,7 +9,7 @@ let
     in if match == null then url else
       "https://cdn.blizzard.com" + (if builtins.elemAt match 4 == null then "" else builtins.elemAt match 4);
   fetchCdn = descriptor: fetchurl {
-    url = cdnUrl descriptor.url;
+    urls = lib.unique [ (cdnUrl descriptor.url) descriptor.url ];
     inherit (descriptor) hash;
   };
   source = lib.cleanSourceWith {

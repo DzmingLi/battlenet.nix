@@ -1,9 +1,12 @@
 """Updater regressions: retry dependencies, optional reuse and release publication."""
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,9 +26,17 @@ class UpdateTests(unittest.TestCase):
         script.write_text('#!/usr/bin/env python3\n' + body)
         script.chmod(0o755)
 
-    def nu(self, expression, success=True):
+    def nu(self, expression, success=True, fast_retries=False):
+        module = ROOT / 'update.nu'
+        if fast_retries:
+            # Exercise the real retry/verification code without wall-clock waits.
+            module = self.work / 'update.nu'
+            source = (ROOT / 'update.nu').read_text()
+            line = next(line for line in source.splitlines() if line.startswith('const RETRY_DELAYS = '))
+            delays = line.split('[', 1)[1].split(']', 1)[0].split()
+            module.write_text(source.replace(line, 'const RETRY_DELAYS = [' + ' '.join('0sec' for _ in delays) + ']'))
         result = subprocess.run(
-            ['nu', '--no-config-file', '-c', 'use ./update.nu *; ' + expression],
+            ['nu', '--no-config-file', '-c', f'use {json.dumps(str(module))} *; ' + expression],
             cwd=ROOT, env=self.env, text=True, capture_output=True,
         )
         if success:
@@ -33,6 +44,71 @@ class UpdateTests(unittest.TestCase):
         else:
             self.assertNotEqual(result.returncode, 0)
         return result
+
+    def server(self, route):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                status, body = route(self.path)
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        return f'http://127.0.0.1:{server.server_port}'
+
+    def test_cdn_servers_keep_official_alternatives_and_china_hosts(self):
+        servers = ['https://us.cdn.blizzard.com', 'https://eu.cdn.blizzard.com',
+                   'http://level3.blizzard.com', 'https://blzdist-hs.necdn.leihuo.netease.com']
+        result = self.nu(f'cdn-servers ({json.dumps(servers)!r} | from json) | to json --raw')
+        self.assertEqual(json.loads(result.stdout), ['https://cdn.blizzard.com', servers[-1]] + servers[:3])
+
+    def test_discovery_recovers_after_five_failures_and_uses_backup(self):
+        config = b'archives = test\n'
+        key = hashlib.md5(config).hexdigest()
+        counts = dict(versions=0, primary=0, backup=0)
+
+        def route(path):
+            if path.endswith('/versions'):
+                counts['versions'] += 1
+                if counts['versions'] <= 5:
+                    return 503, b'temporarily unavailable'
+                return 200, f'Region|BuildConfig|CDNConfig|BuildId|VersionsName\nus|{key}|{key}|1|1.0\n'.encode()
+            if path.endswith('/cdns'):
+                return 200, f'Name|Path|Hosts|Servers\nus|tpr/wow|unused|{endpoint}/primary {endpoint}/backup\n'.encode()
+            if path.startswith('/primary/'):
+                counts['primary'] += 1
+                return 404, b'missing on this mirror'
+            counts['backup'] += 1
+            return 200, config
+
+        endpoint = self.server(route)
+        result = self.nu(f'resolve-release wow us {endpoint} | to json --raw', fast_retries=True)
+        release = json.loads(result.stdout)
+        self.assertEqual(counts, dict(versions=6, primary=2, backup=2))
+        self.assertEqual(release['cdnServers'], [endpoint + '/primary', endpoint + '/backup'])
+        self.assertTrue(release['buildConfig']['url'].startswith(endpoint + '/backup/'))
+
+    def test_discovery_exhausts_transient_errors_but_not_permanent_errors(self):
+        counts = {503: 0, 404: 0}
+
+        def route(path):
+            status = 503 if '/transient/' in path else 404
+            counts[status] += 1
+            return status, b'unavailable'
+
+        endpoint = self.server(route)
+        transient = self.nu(f'resolve-release transient us {endpoint}', success=False, fast_retries=True)
+        self.nu(f'resolve-release permanent us {endpoint}', success=False, fast_retries=True)
+        self.assertEqual(counts, {503: 8, 404: 1})
+        self.assertIn('after 8 attempts', transient.stderr)
 
     def test_cleanup_protects_recent_completed_and_old_active_runs(self):
         runs = [
@@ -114,14 +190,14 @@ elif args[0] not in ('fetch', 'cat-file'):
 counter = pathlib.Path({str(counter)!r})
 attempt = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(attempt))
-if attempt == 1:
+if attempt <= 5:
     print('HTTP error 404', file=sys.stderr)
     sys.exit(1)
 print('/nix/store/verified-catalog')
 ''')
-        result = self.nu('upload-catalog archive.tar.gz https://example.test/catalog sha256-test owner/repo')
+        result = self.nu('upload-catalog archive.tar.gz https://example.test/catalog sha256-test owner/repo', fast_retries=True)
         self.assertEqual(result.stdout.strip(), '/nix/store/verified-catalog')
-        self.assertEqual(counter.read_text(), '2')
+        self.assertEqual(counter.read_text(), '6')
 
     def test_duplicate_upload_requires_successful_hash_verification(self):
         self.command('gh', 'import sys\nprint("already exists", file=sys.stderr)\nsys.exit(1)\n')
@@ -132,10 +208,10 @@ print('/nix/store/verified-catalog')
     def test_publication_failure_reports_upload_and_verification_errors(self):
         self.command('gh', 'import sys\nprint("upload denied", file=sys.stderr)\nsys.exit(1)\n')
         self.command('nix', 'import sys\nprint("hash mismatch", file=sys.stderr)\nsys.exit(1)\n')
-        result = self.nu('upload-catalog archive.tar.gz https://example.test/catalog sha256-test owner/repo', success=False)
+        result = self.nu('upload-catalog archive.tar.gz https://example.test/catalog sha256-test owner/repo', success=False, fast_retries=True)
         self.assertIn('upload denied', result.stderr)
         self.assertIn('hash mismatch', result.stderr)
-        self.assertIn('four attempts', result.stderr)
+        self.assertIn('after 8 attempts', result.stderr)
 
 
 if __name__ == '__main__':

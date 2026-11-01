@@ -13,6 +13,8 @@ import time
 from urllib.error import HTTPError
 import urllib.request
 
+RETRY_DELAYS = (0, 2, 5, 10, 20, 40, 60, 60)
+
 
 def table(text):
     lines = [line for line in text.splitlines() if line and not line.startswith('#')]
@@ -37,19 +39,20 @@ def select(rows, field, value):
 
 def retry_request(request):
     """Retry transport failures only; identity/format checks stay outside."""
-    for attempt in range(4):
+    for attempt, delay in enumerate(RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
         try:
             return request()
         except (OSError, HTTPException) as error:
             if isinstance(error, HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
                 raise
-            if attempt == 3:
+            if attempt == len(RETRY_DELAYS) - 1:
                 raise
-            time.sleep(2 ** attempt)
 
 
 def cdn_url(url):
-    """Use the global CDN entry point without changing pinned catalog metadata."""
+    """Prefer the global entry point while retaining advertised mirror URLs."""
     return re.sub(
         r'^https?://(?:(?:(?:us|eu|kr)\.)?cdn\.blizzard\.com|'
         r'level3(?:\.ssl)?\.blizzard\.com|blizzard\.gcdn\.cloudn\.co\.kr)(?=/|$)',
@@ -57,7 +60,6 @@ def cdn_url(url):
 
 
 def get(url, max_size=None):
-    url = cdn_url(url)
     def request():
         with urllib.request.urlopen(url, timeout=30) as response:
             length = response.headers.get('Content-Length')
@@ -98,8 +100,8 @@ def resolve(product, region, endpoint):
     version = select(table(get(f'{endpoint}/{product}/versions').decode()), 'Region', region)
     cdn = select(table(get(f'{endpoint}/{product}/cdns').decode()), 'Name', region)
     # Servers carries HTTPS alternatives and routing query parameters. Strip the
-    # query before appending the object path. Global aliases share one entry;
-    # NetEase and any other explicitly advertised hosts remain unchanged.
+    # query before appending the object path. Prefer the global entry point,
+    # then retain every advertised mirror as a distinct fallback.
     from urllib.parse import urlsplit
     servers = []
     for value in cdn.get('Servers', '').split():
@@ -109,7 +111,7 @@ def resolve(product, region, endpoint):
     servers.sort(key=lambda value: not value.startswith('https:'))
     if not servers:
         servers = [f'http://{host}' for host in cdn['Hosts'].split()]
-    servers = list(dict.fromkeys(cdn_url(server) for server in servers))
+    servers = list(dict.fromkeys([cdn_url(server) for server in servers] + servers))
     return {
         'schemaVersion': 1, 'product': product, 'region': region,
         'buildId': version['BuildId'], 'version': version['VersionsName'],

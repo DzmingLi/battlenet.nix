@@ -229,9 +229,11 @@ objects are the source data. The Nushell updater resolves releases, orchestrates
 the binary backend, and emits native Nix attribute sets. CDN configuration MD5
 and SHA-256 checks run in Nu; BLTE/TACT/CASC verification stays in Python.
 Nix string interpolation is escaped.
-International downloads use `https://cdn.blizzard.com` as their common entry
-point. The updater collapses Blizzard's global CDN aliases to this address;
-Nix fetches and backend downloads also normalize URLs in older pinned catalogs.
+International downloads prefer `https://cdn.blizzard.com` as their common entry
+point. The updater also retains every officially advertised CDN URL as a fallback,
+and backend requests use each selected URL without rewriting its hostname.
+Full installation downloads try all retained servers. Nix metadata fetches try
+the common entry point and the original pinned URL when they differ.
 China's official NetEase CDN addresses remain unchanged. This affects transport
 only: pinned object hashes, archive offsets and existing installation metadata
 are preserved, so changing the entry point does not invalidate object reuse or
@@ -328,8 +330,12 @@ complete installation before automatic language expansion. An unchanged catalog
 does not create a download job. The first expansion can take many large downloads;
 availability grows as the jobs publish their verified catalogs.
 Discovery failures become failed jobs for the affected game, while other games
-continue. Metadata downloads retry transient transport/HTTP errors up to four
-times and report each failed endpoint. Unchanged configuration keys reuse the
+continue. Metadata, archive index and object downloads make up to eight attempts
+per endpoint for transient transport/HTTP errors, waiting 2, 5, 10, 20, 40, 60 and
+60 seconds between attempts. Permanent HTTP errors still fail immediately.
+Release asset upload/download verification uses the same eight-attempt schedule
+to allow newly uploaded assets time to become available. Unchanged configuration
+keys reuse the
 previously verified records from the same product and distribution; new keys
 still require fresh content verification.
 

@@ -134,7 +134,7 @@ def prepare(bootstrap, cache, names, output, workers=8, data_directory='Data', d
         key = first.get('archive', batch[0]['ekey'])
         errors = []
         for attempt in range(3):
-            for server in release['cdnServers'][:2]:
+            for server in release['cdnServers']:
                 url = f'{server.rstrip("/")}/{release["cdnPath"]}/data/{key[:2]}/{key[2:4]}/{key}'
                 try:
                     raw = tact.bounded_get(url, size, offset, size)
