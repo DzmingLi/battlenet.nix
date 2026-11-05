@@ -60,6 +60,8 @@ jobs:
           REGION: ${{ inputs.region }}
           PLATFORM: ${{ inputs.platform || 'windows' }}
         run: |
+          # Pass Nushell variables literally through Bash.
+          # shellcheck disable=SC2016
           nix develop .#ci --command nu --no-config-file -c '
             use ./update.nu language-jobs
             let jobs = if $env.INITIALIZE == "true" and $env.PLATFORM == "mac" and $env.PRODUCT == "" {
@@ -145,20 +147,62 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          overwrite: true
           name: verified-${{ matrix.catalog }}
           path: |
             artifacts/games/*.nix
             prepared/*.nix
           retention-days: 7
           if-no-files-found: ignore
-      - name: Publish pinned metadata assets and commit with Nushell
+      - name: Prepare validated catalog index for publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: nix develop .#ci --command nu --no-config-file -c 'use ./update.nu publish; publish games'
+          CATALOG: ${{ matrix.catalog }}
+        run: |
+          # Pass Nushell variables literally through Bash.
+          # shellcheck disable=SC2016
+          nix develop .#ci --command nu --no-config-file -c '
+            use ./update.nu prepare-publication
+            let paths = (prepare-publication games)
+            mkdir ready
+            for path in $paths {
+              if $path != $"games/($env.CATALOG).nix" { error make {msg: $"Unexpected catalog ($path)"} }
+              cp $path ready/
+            }
+            {base: $env.GITHUB_SHA, changed: (not ($paths | is-empty))} | to json | save --raw $"ready/($env.CATALOG).json"
+          '
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ready-${{ matrix.catalog }}
+          path: ready/
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, update]
+    if: ${{ !cancelled() && needs.discover.outputs.has_jobs == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ready-*
+          path: incoming
+          merge-multiple: true
+      - name: Commit ready catalog indexes
+        env:
+          MATRIX: ${{ needs.discover.outputs.matrix }}
+          UPDATE_RESULT: ${{ needs.update.result }}
+        run: |
+          nix develop .#ci --command nu --no-config-file .github/publish-ready.nu
 
   cleanup:
-    needs: [discover, update]
-    if: ${{ always() && needs.discover.result == 'success' }}
+    needs: [discover, publish]
+    if: ${{ !cancelled() && needs.discover.result == 'success' && needs.publish.result != 'failure' }}
     concurrency:
       group: catalog-release-cleanup
       cancel-in-progress: false

@@ -362,11 +362,16 @@ The GitHub Actions update workflow runs daily and can be dispatched manually.
 Workflow runs are serialized; their catalog jobs still run in parallel.
 It runs `update.nu` in the CI development shell, generates the catalog,
 validates launcher profiles without instantiating the full object derivation graph,
-and commits successful changes directly to `main` as `github-actions[bot]`.
+and uploads each validated index as a small `ready-*` artifact. One downstream
+job collects the ready indexes and commits them together to `main` as
+`github-actions[bot]`. Successful catalogs can publish even if a sibling failed.
+If only the final push failed, rerun the failed job within the seven-day artifact
+retention window to reuse the prepared indexes.
 There are no automatic pull requests. The workflow uses `contents: write`; a
 repository rule that prohibits bot pushes must allow this workflow's commits.
-Publication integrates current main in an isolated checkout and retries competing
-pushes, never force-pushing. Catalogs changed by another publisher are retained.
+Publication fetches current main in an isolated checkout on every attempt.
+Competing pushes, temporary service failures and transport interruptions retry
+with backoff. Authentication and branch-policy errors surface immediately. Catalogs changed by another publisher are retained.
 Each initialization changes only its own game file.
 Release cleanup preserves catalog references from all runs still eligible for
 GitHub's 30-day re-run window, including the run doing the cleanup, and all
